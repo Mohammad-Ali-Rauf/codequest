@@ -22,6 +22,20 @@ SOLVED_FILE = os.path.join(DATA_DIR, "solved.json")
 CACHE_FILE = os.path.join(CACHE_DIR, "daily.json")
 ALL_PROBLEMS_CACHE = os.path.join(CACHE_DIR, "all_problems.json")
 PROFILE_FILE = os.path.join(DATA_DIR, "profile.json")
+GOALS_FILE = os.path.join(DATA_DIR, "goals.json")
+
+# Goal types
+class GoalType:
+    TOTAL_SOLVED = "total_solved"
+    DAILY_STREAK = "daily_streak" 
+    DIFFICULTY_COUNT = "difficulty_count"
+    WEEKLY_TARGET = "weekly_target"
+
+# Goal status
+class GoalStatus:
+    ACTIVE = "active"
+    COMPLETED = "completed"
+    FAILED = "failed"
 
 # LeetCode GraphQL API endpoint
 LEETCODE_URL = "https://leetcode.com/graphql"
@@ -455,6 +469,9 @@ def display_weekly_report() -> None:
 
 def display_profile() -> None:
     """Display comprehensive profile with statistics."""
+    # Update goal progress first
+    update_goal_progress()
+    
     solved = load_solved()
     stats = calculate_statistics(solved)
     
@@ -477,6 +494,15 @@ def display_profile() -> None:
         bar_length = int((count / max_val) * 20)
         bar = "█" * bar_length
         print(f"{icon} {difficulty:<6} {bar} {count}")
+
+    # Show goal progress
+    goals = load_goals()
+    active_goals = [g for g in goals if g["status"] == GoalStatus.ACTIVE]
+    if active_goals:
+        print("\n🎯 ACTIVE GOALS:")
+        for goal in active_goals[:3]:  # Show first 3 active goals
+            progress = (goal["current"] / goal["target"]) * 100
+            print(f"   {goal['name']}: {goal['current']}/{goal['target']} ({progress:.1f}%)")
     
     # Heatmap display (grouped by weeks)
     heatmap_chars = list(stats['heatmap'])
@@ -549,6 +575,127 @@ def mark_problem_status(problem_id: str, mark_as_solved: bool, force_refresh: bo
         save_json_file(PROFILE_FILE, stats)
 
 # =============================================================================
+# GOAL MANAGEMENT
+# =============================================================================
+
+def load_goals() -> List[Dict]:
+    """Load goals from file."""
+    return load_json_file(GOALS_FILE, [])
+
+def save_goals(goals: List[Dict]) -> None:
+    """Save goals to file."""
+    save_json_file(GOALS_FILE, goals)
+
+def create_goal(name: str, goal_type: str, target: int, difficulty: str = None, deadline_days: int = 30) -> None:
+    """Create a new goal."""
+    goals = load_goals()
+    
+    goal = {
+        "id": len(goals) + 1,
+        "name": name,
+        "type": goal_type,
+        "target": target,
+        "current": 0,
+        "difficulty": difficulty,
+        "created_date": date.today().isoformat(),
+        "deadline": (date.today() + timedelta(days=deadline_days)).isoformat(),
+        "status": GoalStatus.ACTIVE
+    }
+    
+    goals.append(goal)
+    save_goals(goals)
+    print(f"✅ Goal '{name}' created! (ID: {goal['id']})")
+
+def update_goal_progress() -> None:
+    """Update progress for all active goals based on current stats."""
+    goals = load_goals()
+    if not goals:
+        return
+        
+    stats = calculate_statistics(load_solved())
+    solved = load_solved()
+    
+    # Get recent solves (last 7 days for weekly targets)
+    week_ago = datetime.utcnow() - timedelta(days=7)
+    recent_solves = [p for p in solved if datetime.fromisoformat(p["completed_at"]) >= week_ago]
+    
+    for goal in goals:
+        if goal["status"] != GoalStatus.ACTIVE:
+            continue
+            
+        if goal["type"] == GoalType.TOTAL_SOLVED:
+            goal["current"] = stats["total_solved"]
+        elif goal["type"] == GoalType.DAILY_STREAK:
+            goal["current"] = stats["current_streak"]
+        elif goal["type"] == GoalType.DIFFICULTY_COUNT and goal["difficulty"]:
+            goal["current"] = stats["by_difficulty"][goal["difficulty"]]
+        elif goal["type"] == GoalType.WEEKLY_TARGET:
+            goal["current"] = len(recent_solves)
+        
+        # Check if goal is completed
+        if goal["current"] >= goal["target"]:
+            goal["status"] = GoalStatus.COMPLETED
+            goal["completed_date"] = date.today().isoformat()
+        # Check if goal is failed (past deadline)
+        elif date.fromisoformat(goal["deadline"]) < date.today():
+            goal["status"] = GoalStatus.FAILED
+    
+    save_goals(goals)
+
+def display_goals() -> None:
+    """Display all goals with progress."""
+    update_goal_progress()  # Refresh progress first
+    goals = load_goals()
+    
+    if not goals:
+        print("🎯 No goals set yet. Use 'leetcode create-goal' to get started!")
+        return
+    
+    active_goals = [g for g in goals if g["status"] == GoalStatus.ACTIVE]
+    completed_goals = [g for g in goals if g["status"] == GoalStatus.COMPLETED]
+    
+    print("\n🎯 YOUR GOALS\n")
+    
+    if active_goals:
+        print("📈 ACTIVE GOALS:")
+        for goal in active_goals:
+            progress = (goal["current"] / goal["target"]) * 100
+            bar = "█" * int(progress / 5) + "░" * (20 - int(progress / 5))
+            deadline = date.fromisoformat(goal["deadline"])
+            days_left = (deadline - date.today()).days
+            
+            print(f"   {goal['id']}. {goal['name']}")
+            print(f"      {bar} {goal['current']}/{goal['target']} ({progress:.1f}%)")
+            print(f"      📅 Deadline: {deadline} ({days_left} days left)")
+            if goal["difficulty"]:
+                print(f"      🎯 Difficulty: {goal['difficulty']}")
+            print()
+    
+    if completed_goals:
+        print("✅ COMPLETED GOALS:")
+        for goal in completed_goals:
+            completed_date = goal.get("completed_date", goal["deadline"])
+            print(f"   {goal['id']}. {goal['name']} - Completed on {completed_date}")
+        print()
+
+def quick_start_goals() -> None:
+    """Create some default goals for new users."""
+    goals = load_goals()
+    if goals:
+        return
+        
+    default_goals = [
+        {"name": "First Steps", "type": GoalType.TOTAL_SOLVED, "target": 5, "difficulty": None, "deadline_days": 14},
+        {"name": "Weekly Warrior", "type": GoalType.WEEKLY_TARGET, "target": 3, "difficulty": None, "deadline_days": 7},
+        {"name": "Streak Builder", "type": GoalType.DAILY_STREAK, "target": 3, "difficulty": None, "deadline_days": 10},
+    ]
+    
+    for goal_data in default_goals:
+        create_goal(**goal_data)
+    
+    print("🎯 Created starter goals! Use 'leetcode goals' to view them.")
+
+# =============================================================================
 # COMMAND LINE INTERFACE
 # =============================================================================
 
@@ -565,6 +712,9 @@ Usage:
   leetcode report                    Show weekly activity report
   leetcode get profile               Show overall stats, streaks and goals
   leetcode stats                     Alias for 'get profile'
+  leetcode goals                     View your goals and progress
+  leetcode create-goal [args]        Create a new goal
+  leetcode quick-goals               Create starter goals for beginners
 
 Options for 'fetch':
   -d YYYY-MM-DD      Fetch for a specific date
@@ -587,9 +737,27 @@ def main() -> None:
 
     command = sys.argv[1]
 
+    # Quick start goals for new users
+    if not os.path.exists(GOALS_FILE):
+        quick_start_goals()
+
     if command in ("-h", "--help"):
         print_help()
     
+    elif command == "goals":
+        display_goals()
+    
+    elif command == "create-goal" and len(sys.argv) >= 5:
+        # leetcode create-goal "Goal Name" total_solved 10
+        name = sys.argv[2]
+        goal_type = sys.argv[3]
+        target = int(sys.argv[4])
+        difficulty = sys.argv[5] if len(sys.argv) > 5 else None
+        create_goal(name, goal_type, target, difficulty)
+    
+    elif command == "quick-goals":
+        quick_start_goals()
+
     elif command == "fetch":
         seed_date = parse_date_arg(sys.argv[2:])
         force_refresh = "--refresh-cache" in sys.argv[2:]
