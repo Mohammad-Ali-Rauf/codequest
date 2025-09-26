@@ -95,6 +95,8 @@ def graphql_request(query: str, retries: int = 3, delay: float = 1) -> Dict:
     Raises:
         requests.RequestException: If all retries fail
     """
+    last_exception = None
+
     for attempt in range(retries):
         try:
             response = requests.post(LEETCODE_URL, json={"query": query})
@@ -102,10 +104,12 @@ def graphql_request(query: str, retries: int = 3, delay: float = 1) -> Dict:
             return response.json()
         except requests.RequestException as e:
             if attempt < retries - 1:
+                last_exception = e;
                 time.sleep(delay * (2 ** attempt))  # exponential backoff
-                continue
-            else:
-                raise e
+    if last_exception:
+        raise last_exception
+    else:
+        raise requests.RequestException("All retries failed")
 
 def parse_date_arg(args: List[str]) -> date:
     """
@@ -178,7 +182,7 @@ def save_daily_cache(problems: Dict, seed_date: date) -> None:
         "problems": problems
     })
 
-def find_problem_by_id(problem_id: str, search_sources: List[Dict]) -> Optional[Dict]:
+def find_problem_by_id(problem_id: str, search_sources: List[Optional[Dict]]) -> Optional[Dict]:
     """
     Find problem by ID in multiple search sources.
     
@@ -586,7 +590,7 @@ def save_goals(goals: List[Dict]) -> None:
     """Save goals to file."""
     save_json_file(GOALS_FILE, goals)
 
-def create_goal(name: str, goal_type: str, target: int, difficulty: str = None, deadline_days: int = 30) -> None:
+def create_goal(name: str, goal_type: str, target: int, difficulty: str | None = None, deadline_days: int = 30) -> None:
     """Create a new goal."""
     goals = load_goals()
     
@@ -685,9 +689,9 @@ def quick_start_goals() -> None:
         return
         
     default_goals = [
-        {"name": "First Steps", "type": GoalType.TOTAL_SOLVED, "target": 5, "difficulty": None, "deadline_days": 14},
-        {"name": "Weekly Warrior", "type": GoalType.WEEKLY_TARGET, "target": 3, "difficulty": None, "deadline_days": 7},
-        {"name": "Streak Builder", "type": GoalType.DAILY_STREAK, "target": 3, "difficulty": None, "deadline_days": 10},
+        {"name": "First Steps", "goal_type": GoalType.TOTAL_SOLVED, "target": 5, "difficulty": None, "deadline_days": 14},
+        {"name": "Weekly Warrior", "goal_type": GoalType.WEEKLY_TARGET, "target": 3, "difficulty": None, "deadline_days": 7},
+        {"name": "Streak Builder", "goal_type": GoalType.DAILY_STREAK, "target": 3, "difficulty": None, "deadline_days": 10},
     ]
     
     for goal_data in default_goals:
@@ -753,7 +757,7 @@ def main() -> None:
         goal_type = sys.argv[3]
         target = int(sys.argv[4])
         difficulty = sys.argv[5] if len(sys.argv) > 5 else None
-        create_goal(name, goal_type, target, difficulty)
+        create_goal(name, goal_type, target, str(difficulty))
     
     elif command == "quick-goals":
         quick_start_goals()
