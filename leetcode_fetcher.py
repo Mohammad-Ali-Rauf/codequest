@@ -1,804 +1,897 @@
 #!/usr/bin/env python3
+"""
+LeetCode Tracker CLI - Production Ready
 
-import requests
+A streamlined CLI tool for tracking LeetCode progress with goals, statistics,
+and daily problem recommendations.
+"""
+
+import asyncio
+import aiohttp
 import random
 import json
 import os
-import time
 import sys
-from datetime import date, timedelta, datetime
-from typing import Dict, List, Optional, Any
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from typing import Dict, List, Optional, Any, Tuple
+from dataclasses import dataclass, asdict
+from enum import Enum
+import hashlib
 
 # =============================================================================
-# CONSTANTS AND CONFIGURATION
+# CONFIGURATION & CONSTANTS
 # =============================================================================
 
-# Directory paths for data and cache storage
-DATA_DIR = os.path.expanduser("~/.local/share/leetcode_tracker")
-CACHE_DIR = os.path.expanduser("~/.cache/leetcode_tracker")
-
-# File paths
-SOLVED_FILE = os.path.join(DATA_DIR, "solved.json")
-CACHE_FILE = os.path.join(CACHE_DIR, "daily.json")
-ALL_PROBLEMS_CACHE = os.path.join(CACHE_DIR, "all_problems.json")
-PROFILE_FILE = os.path.join(DATA_DIR, "profile.json")
-GOALS_FILE = os.path.join(DATA_DIR, "goals.json")
-
-# Goal types
-class GoalType:
+class GoalType(str, Enum):
     TOTAL_SOLVED = "total_solved"
     DAILY_STREAK = "daily_streak" 
     DIFFICULTY_COUNT = "difficulty_count"
     WEEKLY_TARGET = "weekly_target"
 
-# Goal status
-class GoalStatus:
+class GoalStatus(str, Enum):
     ACTIVE = "active"
     COMPLETED = "completed"
     FAILED = "failed"
 
-# LeetCode GraphQL API endpoint
+class Difficulty(str, Enum):
+    EASY = "Easy"
+    MEDIUM = "Medium"
+    HARD = "Hard"
+
+# Path configuration
+BASE_DIR = Path.home() / ".local" / "share" / "leetcode_tracker"
+CACHE_DIR = Path.home() / ".cache" / "leetcode_tracker"
+
+# File paths
+SOLVED_FILE = BASE_DIR / "solved.json"
+CACHE_FILE = CACHE_DIR / "daily.json"
+ALL_PROBLEMS_CACHE = CACHE_DIR / "all_problems.json"
+PROFILE_FILE = BASE_DIR / "profile.json"
+GOALS_FILE = BASE_DIR / "goals.json"
+
+# API configuration
 LEETCODE_URL = "https://leetcode.com/graphql"
+REQUEST_TIMEOUT = 10
+MAX_RETRIES = 3
 
-# GraphQL query to get all problems
-ALL_PROBLEMS_QUERY = """
-{
-  problemsetQuestionList: questionList(categorySlug: "", filters: {}, limit: 500) {
-    questions: data {
-      acRate
-      difficulty
-      frontendQuestionId: questionFrontendId
-      paidOnly: isPaidOnly
-      title
-      titleSlug
-    }
-  }
+# Display configuration
+DIFFICULTY_ICONS = {
+    Difficulty.EASY: "🟢",
+    Difficulty.MEDIUM: "🟡", 
+    Difficulty.HARD: "🔴"
 }
-"""
 
-# Difficulty configuration
-DIFFICULTIES = ["easy", "medium", "hard"]
-DIFFICULTY_ICONS = {"easy": "🟢", "medium": "🟡", "hard": "🔴"}
-DIFFICULTY_COLORS = {"Easy": "🟢", "Medium": "🟡", "Hard": "🔴"}
-
-# Heatmap configuration
 HEATMAP_LEVELS = {
+    0: "⚫",  # 0 problems
     1: "🟢",  # 1 problem
     2: "🟡",  # 2 problems  
     3: "🟠",  # 3 problems
     4: "🔴",  # 4+ problems
 }
-HEATMAP_EMPTY = "⚫"
-HEATMAP_DAYS = 30
 
 # =============================================================================
-# HELPER FUNCTIONS
+# DATA MODELS
 # =============================================================================
 
-def ensure_directories() -> None:
-    """Ensure necessary directories exist."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    os.makedirs(CACHE_DIR, exist_ok=True)
-
-def graphql_request(query: str, retries: int = 3, delay: float = 1) -> Dict:
-    """
-    Make a GraphQL request to LeetCode API with exponential backoff retry logic.
+@dataclass
+class Problem:
+    """Represents a LeetCode problem."""
+    id: str
+    title: str
+    slug: str
+    difficulty: Difficulty
+    ac_rate: float
+    paid_only: bool = False
     
-    Args:
-        query: GraphQL query string
-        retries: Number of retry attempts
-        delay: Base delay between retries
-    
-    Returns:
-        JSON response from API
-        
-    Raises:
-        requests.RequestException: If all retries fail
-    """
-    last_exception = None
+    @property
+    def url(self) -> str:
+        return f"https://leetcode.com/problems/{self.slug}/"
 
-    for attempt in range(retries):
+@dataclass
+class SolvedProblem:
+    """Represents a solved problem with completion metadata."""
+    problem_id: str
+    title: str
+    slug: str
+    difficulty: Difficulty
+    completed_at: str
+    
+    @classmethod
+    def from_problem(cls, problem: Problem) -> 'SolvedProblem':
+        return cls(
+            problem_id=problem.id,
+            title=problem.title,
+            slug=problem.slug,
+            difficulty=problem.difficulty,
+            completed_at=datetime.utcnow().isoformat()
+        )
+
+@dataclass
+class Goal:
+    """Represents a user goal."""
+    id: int
+    name: str
+    type: GoalType
+    target: int
+    current: int = 0
+    difficulty: Optional[Difficulty] = None
+    created_date: str = None
+    deadline: str = None
+    status: GoalStatus = GoalStatus.ACTIVE
+    
+    def __post_init__(self):
+        if self.created_date is None:
+            self.created_date = date.today().isoformat()
+        if self.deadline is None:
+            self.deadline = (date.today() + timedelta(days=30)).isoformat()
+    
+    @property
+    def progress_percentage(self) -> float:
+        return (self.current / self.target) * 100 if self.target > 0 else 0
+    
+    @property
+    def days_remaining(self) -> int:
+        return (date.fromisoformat(self.deadline) - date.today()).days
+
+@dataclass
+class UserStats:
+    """Represents user statistics."""
+    total_solved: int = 0
+    by_difficulty: Dict[Difficulty, int] = None
+    current_streak: int = 0
+    longest_streak: int = 0
+    heatmap: str = ""
+    
+    def __post_init__(self):
+        if self.by_difficulty is None:
+            self.by_difficulty = {diff: 0 for diff in Difficulty}
+
+# =============================================================================
+# CORE SERVICES
+# =============================================================================
+
+class CacheService:
+    """Handles data caching with TTL support."""
+    
+    @staticmethod
+    def ensure_directories() -> None:
+        """Ensure necessary directories exist."""
+        BASE_DIR.mkdir(parents=True, exist_ok=True)
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    
+    @staticmethod
+    def load_json(filepath: Path, default: Any = None) -> Any:
+        """Load JSON data from file with error handling."""
         try:
-            response = requests.post(LEETCODE_URL, json={"query": query})
-            response.raise_for_status()
-            return response.json()
-        except requests.RequestException as e:
-            if attempt < retries - 1:
-                last_exception = e;
-                time.sleep(delay * (2 ** attempt))  # exponential backoff
-    if last_exception:
-        raise last_exception
-    else:
-        raise requests.RequestException("All retries failed")
-
-def parse_date_arg(args: List[str]) -> date:
-    """
-    Parse date arguments from command line.
+            if filepath.exists():
+                return json.loads(filepath.read_text())
+        except (json.JSONDecodeError, IOError) as e:
+            print(f"⚠️ Warning: Could not load {filepath}: {e}")
+        return default if default is not None else {}
     
-    Args:
-        args: Command line arguments
-        
-    Returns:
-        Parsed date object
-    """
-    if "--today" in args:
-        return date.today()
-    if "--yesterday" in args:
-        return date.today() - timedelta(days=1)
-
-    # Support -d YYYY-MM-DD or --date=YYYY-MM-DD
-    if "-d" in args:
-        idx = args.index("-d")
-        if idx + 1 < len(args):
-            return datetime.strptime(args[idx + 1], "%Y-%m-%d").date()
-
-    for arg in args:
-        if arg.startswith("--date="):
-            return datetime.strptime(arg.split("=", 1)[1], "%Y-%m-%d").date()
-
-    return date.today()  # default to today
-
-def load_json_file(filepath: str, default: Any = None) -> Any:
-    """Load JSON data from file, return default if file doesn't exist."""
-    if os.path.exists(filepath):
-        with open(filepath, "r") as f:
-            return json.load(f)
-    return default if default is not None else {}
-
-def save_json_file(filepath: str, data: Any) -> None:
-    """Save data as JSON to file."""
-    with open(filepath, "w") as f:
-        json.dump(data, f, indent=2)
-
-# =============================================================================
-# CACHE MANAGEMENT
-# =============================================================================
-
-def load_all_problems_cache() -> Optional[Dict]:
-    """Load cached problems if they're from today."""
-    data = load_json_file(ALL_PROBLEMS_CACHE, {})
-    if data.get("date") == date.today().isoformat():
-        return data.get("problems", {})
-    return None
-
-def save_all_problems_cache(problems: List[Dict]) -> None:
-    """Save problems to cache with today's date."""
-    save_json_file(ALL_PROBLEMS_CACHE, {
-        "date": date.today().isoformat(),
-        "problems": {str(p["frontendQuestionId"]): p for p in problems}
-    })
-
-def load_daily_cache(seed_date: date) -> Optional[Dict]:
-    """Load cached daily problems for specific date."""
-    data = load_json_file(CACHE_FILE, {})
-    if data.get("date") == seed_date.isoformat():
-        return data.get("problems")
-    return None
-
-def save_daily_cache(problems: Dict, seed_date: date) -> None:
-    """Save daily problems to cache with date."""
-    save_json_file(CACHE_FILE, {
-        "date": seed_date.isoformat(), 
-        "problems": problems
-    })
-
-def find_problem_by_id(problem_id: str, search_sources: List[Optional[Dict]]) -> Optional[Dict]:
-    """
-    Find problem by ID in multiple search sources.
+    @staticmethod
+    def save_json(filepath: Path, data: Any) -> bool:
+        """Save data as JSON to file with error handling."""
+        try:
+            filepath.parent.mkdir(parents=True, exist_ok=True)
+            filepath.write_text(json.dumps(data, indent=2))
+            return True
+        except IOError as e:
+            print(f"❌ Error saving to {filepath}: {e}")
+            return False
     
-    Args:
-        problem_id: Problem ID to search for
-        search_sources: List of dictionaries to search in
+    @staticmethod
+    def is_cache_valid(filepath: Path, ttl_days: int = 1) -> bool:
+        """Check if cache file is still valid."""
+        if not filepath.exists():
+            return False
         
-    Returns:
-        Problem data if found, None otherwise
-    """
-    for source in search_sources:
-        if not source:
-            continue
-        problem = source.get(str(problem_id))
-        if problem:
-            return problem
-    return None
+        cache_date = datetime.fromtimestamp(filepath.stat().st_mtime).date()
+        return (date.today() - cache_date).days < ttl_days
 
-# =============================================================================
-# PROBLEM DATA MANAGEMENT
-# =============================================================================
-
-def fetch_all_problems(force_refresh: bool = False) -> Dict:
-    """
-    Fetch all problems from LeetCode API or cache.
+class LeetCodeAPI:
+    """Handles communication with LeetCode GraphQL API."""
     
-    Args:
-        force_refresh: Whether to ignore cache and fetch fresh data
-        
-    Returns:
-        Dictionary of problems keyed by ID
+    ALL_PROBLEMS_QUERY = """
+    {
+      problemsetQuestionList: questionList(categorySlug: "", filters: {}, limit: 500) {
+        questions: data {
+          acRate
+          difficulty
+          frontendQuestionId: questionFrontendId
+          paidOnly: isPaidOnly
+          title
+          titleSlug
+        }
+      }
+    }
     """
-    if not force_refresh:
-        cached = load_all_problems_cache()
-        if cached:
-            return cached
-
-    try:
-        response = graphql_request(ALL_PROBLEMS_QUERY)
-        all_problems = response["data"]["problemsetQuestionList"]["questions"]
-        save_all_problems_cache(all_problems)
-        return {str(p["frontendQuestionId"]): p for p in all_problems}
-    except Exception as e:
-        print(f"❌ Error fetching all problems: {e}")
+    
+    def __init__(self):
+        self.session = None
+    
+    async def __aenter__(self):
+        self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT))
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self.session:
+            await self.session.close()
+    
+    async def fetch_all_problems(self) -> Dict[str, Problem]:
+        """Fetch all problems from LeetCode API."""
+        for attempt in range(MAX_RETRIES):
+            try:
+                async with self.session.post(
+                    LEETCODE_URL, 
+                    json={"query": self.ALL_PROBLEMS_QUERY},
+                    headers={"Content-Type": "application/json"}
+                ) as response:
+                    response.raise_for_status()
+                    data = await response.json()
+                    
+                    problems = {}
+                    for item in data["data"]["problemsetQuestionList"]["questions"]:
+                        problem = Problem(
+                            id=str(item["frontendQuestionId"]),
+                            title=item["title"],
+                            slug=item["titleSlug"],
+                            difficulty=Difficulty(item["difficulty"]),
+                            ac_rate=float(item["acRate"]),
+                            paid_only=bool(item["paidOnly"])
+                        )
+                        problems[problem.id] = problem
+                    
+                    return problems
+                    
+            except (aiohttp.ClientError, KeyError, ValueError) as e:
+                if attempt == MAX_RETRIES - 1:
+                    raise e
+                await asyncio.sleep(2 ** attempt)  # Exponential backoff
+        
         return {}
 
-def get_random_unsolved_problems(seed_date: date) -> Dict[str, Optional[Dict]]:
-    """
-    Get random unsolved problems for a specific date.
+class ProblemService:
+    """Manages problem data and recommendations."""
     
-    Args:
-        seed_date: Date to use as random seed
+    def __init__(self, cache_service: CacheService):
+        self.cache = cache_service
+    
+    async def get_all_problems(self, force_refresh: bool = False) -> Dict[str, Problem]:
+        """Get all problems, using cache when possible."""
+        if not force_refresh and self.cache.is_cache_valid(ALL_PROBLEMS_CACHE):
+            cached = self.cache.load_json(ALL_PROBLEMS_CACHE, {})
+            return {pid: Problem(**data) for pid, data in cached.items()}
         
-    Returns:
-        Dictionary with easy, medium, hard problems
-    """
-    # Try cache first
-    cached = load_daily_cache(seed_date)
-    if cached:
-        return cached
-
-    try:
-        # Set random seed based on date for consistent daily problems
+        try:
+            async with LeetCodeAPI() as api:
+                problems = await api.fetch_all_problems()
+                
+                # Cache the problems
+                cache_data = {pid: asdict(problem) for pid, problem in problems.items()}
+                self.cache.save_json(ALL_PROBLEMS_CACHE, cache_data)
+                
+                return problems
+        except Exception as e:
+            print(f"❌ Error fetching problems: {e}")
+            # Fallback to cache even if stale
+            cached = self.cache.load_json(ALL_PROBLEMS_CACHE, {})
+            return {pid: Problem(**data) for pid, data in cached.items()}
+    
+    def get_daily_problems(self, seed_date: date) -> Dict[Difficulty, Optional[Problem]]:
+        """Get random unsolved problems for a specific date."""
+        # Try cache first
+        cache_key = f"{seed_date.isoformat()}_problems"
+        cached_data = self.cache.load_json(CACHE_FILE, {})
+        
+        if cache_key in cached_data:
+            cached_problems = cached_data[cache_key]
+            return {
+                Difficulty(diff): Problem(**data) if data else None
+                for diff, data in cached_problems.items()
+            }
+        
+        # Will be populated by async method
+        return {diff: None for diff in Difficulty}
+    
+    async def generate_daily_problems(self, seed_date: date) -> Dict[Difficulty, Optional[Problem]]:
+        """Generate and cache random unsolved problems for a date."""
+        all_problems = await self.get_all_problems()
+        solved_ids = {sp.problem_id for sp in self.get_solved_problems()}
+        
+        # Filter free, unsolved problems
+        free_unsolved = [
+            problem for problem in all_problems.values()
+            if not problem.paid_only and problem.id not in solved_ids
+        ]
+        
+        # Group by difficulty
+        problems_by_diff = {
+            difficulty: [p for p in free_unsolved if p.difficulty == difficulty]
+            for difficulty in Difficulty
+        }
+        
+        # Set seed for consistent daily problems
         seed = int(seed_date.strftime("%Y%m%d"))
         random.seed(seed)
-
-        # Fetch problems and filter
-        all_problems = fetch_all_problems()
-        solved_ids = {str(p["id"]) for p in load_solved()}
         
-        free_problems = [
-            p for p in all_problems.values() 
-            if not p.get("paidOnly") and str(p["frontendQuestionId"]) not in solved_ids
-        ]
-
-        # Categorize by difficulty
-        problems_by_diff = {
-            "easy": [p for p in free_problems if p["difficulty"] == "Easy"],
-            "medium": [p for p in free_problems if p["difficulty"] == "Medium"],
-            "hard": [p for p in free_problems if p["difficulty"] == "Hard"],
-        }
-
         # Select random problems
-        result = {
+        daily_problems = {
             diff: random.choice(problems) if problems else None
             for diff, problems in problems_by_diff.items()
         }
-
-        save_daily_cache(result, seed_date)
-        return result
-
-    except Exception as e:
-        print(f"❌ Error fetching problems: {e}")
-        return {}
-
-def load_solved() -> List[Dict]:
-    """Load list of solved problems."""
-    return load_json_file(SOLVED_FILE, [])
-
-def save_solved(solved: List[Dict]) -> None:
-    """Save solved problems list."""
-    save_json_file(SOLVED_FILE, solved)
-
-# =============================================================================
-# DISPLAY FUNCTIONS
-# =============================================================================
-
-def display_problems(problems: Dict) -> None:
-    """Display problems in a formatted way."""
-    if not problems:
-        print("❌ Failed to fetch problems.")
-        return
-
-    solved_ids = {p["id"] for p in load_solved()}
-    
-    print("\n🎯 Your Daily LeetCode Challenge (Random Unsolved):\n")
-
-    for difficulty in DIFFICULTIES:
-        problem = problems.get(difficulty)
-        icon = DIFFICULTY_ICONS.get(difficulty, "❓")
         
-        if problem:
-            solved_marker = " ✅" if str(problem["frontendQuestionId"]) in solved_ids else ""
-            print(f"{icon} {difficulty.upper()}:")
-            print(f"   ID: {problem['frontendQuestionId']}{solved_marker}")
-            print(f"   Title: {problem['title']}")
-            print(f"   Acceptance: {problem['acRate']:.1f}%")
-            print(f"   Link: https://leetcode.com/problems/{problem['titleSlug']}/\n")
-        else:
-            print(f"❌ No {difficulty} problem available today.")
-
-def display_solved_problems() -> None:
-    """Display all solved problems."""
-    solved = sorted(load_solved(), key=lambda p: int(p["id"]))
-    
-    if not solved:
-        print("📂 No problems solved yet.")
-        return
-
-    print("\n📂 Solved Problems:\n")
-    
-    for problem in solved:
-        icon = DIFFICULTY_COLORS.get(problem["difficulty"], "❓")
-        print(f"{icon} [{problem['id']}] {problem['title']} ({problem['difficulty']})")
-        print(f"   🔗 https://leetcode.com/problems/{problem['slug']}/\n")
-
-# =============================================================================
-# PROFILE AND STATISTICS
-# =============================================================================
-
-def calculate_streaks(solved_problems: List[Dict]) -> tuple[int, int]:
-    """
-    Calculate current and longest streaks from solved problems.
-    
-    Args:
-        solved_problems: List of solved problem records
+        # Cache results
+        cache_data = self.cache.load_json(CACHE_FILE, {})
+        cache_key = f"{seed_date.isoformat()}_problems"
+        cache_data[cache_key] = {
+            diff.value: asdict(problem) if problem else None
+            for diff, problem in daily_problems.items()
+        }
+        self.cache.save_json(CACHE_FILE, cache_data)
         
-    Returns:
-        Tuple of (current_streak, longest_streak)
-    """
-    if not solved_problems:
-        return 0, 0
+        return daily_problems
+    
+    def get_solved_problems(self) -> List[SolvedProblem]:
+        """Load solved problems from storage."""
+        data = self.cache.load_json(SOLVED_FILE, [])
+        return [SolvedProblem(**item) for item in data]
+    
+    def save_solved_problems(self, solved: List[SolvedProblem]) -> bool:
+        """Save solved problems to storage."""
+        return self.cache.save_json(SOLVED_FILE, [asdict(sp) for sp in solved])
+    
+    def mark_problem_solved(self, problem_id: str, problem: Problem) -> bool:
+        """Mark a problem as solved."""
+        solved = self.get_solved_problems()
+        
+        # Check if already solved
+        if any(sp.problem_id == problem_id for sp in solved):
+            return False
+        
+        solved_problem = SolvedProblem.from_problem(problem)
+        solved.append(solved_problem)
+        
+        return self.save_solved_problems(solved)
+    
+    def mark_problem_unsolved(self, problem_id: str) -> bool:
+        """Mark a problem as unsolved."""
+        solved = self.get_solved_problems()
+        original_count = len(solved)
+        
+        solved = [sp for sp in solved if sp.problem_id != problem_id]
+        
+        if len(solved) == original_count:
+            return False  # Problem wasn't solved
+        
+        return self.save_solved_problems(solved)
 
-    # Get unique solved dates
-    dates = sorted({
-        datetime.fromisoformat(p["completed_at"]).date() 
-        for p in solved_problems
-    })
+class StatsService:
+    """Calculates and manages user statistics."""
     
-    # Calculate longest streak
-    longest_streak = 1
-    current_streak = 1
+    def __init__(self, problem_service: ProblemService):
+        self.problem_service = problem_service
     
-    for i in range(1, len(dates)):
-        if (dates[i] - dates[i-1]).days == 1:
+    def calculate_stats(self, solved_problems: List[SolvedProblem]) -> UserStats:
+        """Calculate comprehensive user statistics."""
+        if not solved_problems:
+            return UserStats(heatmap=self._generate_heatmap([]))
+        
+        # Basic counts
+        by_difficulty = {diff: 0 for diff in Difficulty}
+        for problem in solved_problems:
+            by_difficulty[problem.difficulty] += 1
+        
+        total_solved = len(solved_problems)
+        current_streak, longest_streak = self._calculate_streaks(solved_problems)
+        heatmap = self._generate_heatmap(solved_problems)
+        
+        return UserStats(
+            total_solved=total_solved,
+            by_difficulty=by_difficulty,
+            current_streak=current_streak,
+            longest_streak=longest_streak,
+            heatmap=heatmap
+        )
+    
+    def _calculate_streaks(self, solved_problems: List[SolvedProblem]) -> Tuple[int, int]:
+        """Calculate current and longest streaks."""
+        if not solved_problems:
+            return 0, 0
+        
+        # Get unique solved dates
+        dates = sorted({
+            datetime.fromisoformat(p.completed_at).date() 
+            for p in solved_problems
+        })
+        
+        # Calculate streaks
+        current_streak = 0
+        longest_streak = 1
+        temp_streak = 1
+        
+        for i in range(1, len(dates)):
+            if (dates[i] - dates[i-1]).days == 1:
+                temp_streak += 1
+                longest_streak = max(longest_streak, temp_streak)
+            else:
+                temp_streak = 1
+        
+        # Calculate current streak (consecutive days up to today)
+        check_date = date.today()
+        while check_date in set(dates):
             current_streak += 1
-            longest_streak = max(longest_streak, current_streak)
-        else:
-            current_streak = 1
-
-    # Calculate current streak (consecutive days up to today)
-    current_streak = 0
-    day_check = date.today()
-    solved_dates_set = set(dates)
-    
-    while day_check in solved_dates_set:
-        current_streak += 1
-        day_check -= timedelta(days=1)
-
-    return current_streak, max(longest_streak, 1)
-
-def generate_heatmap(solved_problems: List[Dict], days: int = HEATMAP_DAYS) -> str:
-    """
-    Generate heatmap string for recent activity.
-    
-    Args:
-        solved_problems: List of solved problems
-        days: Number of days to include in heatmap
+            check_date -= timedelta(days=1)
         
-    Returns:
-        Heatmap as string of emojis
-    """
-    if not solved_problems:
-        return HEATMAP_EMPTY * days
+        return current_streak, max(longest_streak, 1)
     
-    today = date.today()
-    date_range = [today - timedelta(days=i) for i in range(days-1, -1, -1)]
-    
-    # Count problems solved per day
-    daily_counts = {}
-    for problem in solved_problems:
-        problem_date = datetime.fromisoformat(problem["completed_at"]).date()
-        if problem_date in date_range:
-            daily_counts[problem_date] = daily_counts.get(problem_date, 0) + 1
-    
-    # Generate heatmap characters
-    heatmap_chars = []
-    for day_date in date_range:
-        count = daily_counts.get(day_date, 0)
-        if count == 0:
-            heatmap_chars.append(HEATMAP_EMPTY)
-        else:
-            # Use appropriate emoji based on problem count
+    def _generate_heatmap(self, solved_problems: List[SolvedProblem], days: int = 30) -> str:
+        """Generate activity heatmap for recent days."""
+        if not solved_problems:
+            return HEATMAP_LEVELS[0] * days
+        
+        today = date.today()
+        date_range = [today - timedelta(days=i) for i in range(days-1, -1, -1)]
+        
+        # Count problems solved per day
+        daily_counts = {}
+        for problem in solved_problems:
+            problem_date = datetime.fromisoformat(problem.completed_at).date()
+            if problem_date in date_range:
+                daily_counts[problem_date] = daily_counts.get(problem_date, 0) + 1
+        
+        # Generate heatmap
+        heatmap = []
+        for day_date in date_range:
+            count = daily_counts.get(day_date, 0)
             for threshold, emoji in sorted(HEATMAP_LEVELS.items(), reverse=True):
                 if count >= threshold:
-                    heatmap_chars.append(emoji)
+                    heatmap.append(emoji)
                     break
+        
+        return "".join(heatmap)
+
+class GoalService:
+    """Manages user goals and progress tracking."""
+    
+    def __init__(self, cache_service: CacheService, stats_service: StatsService):
+        self.cache = cache_service
+        self.stats = stats_service
+    
+    def get_goals(self) -> List[Goal]:
+        """Load goals from storage."""
+        data = self.cache.load_json(GOALS_FILE, [])
+        return [Goal(**item) for item in data]
+    
+    def save_goals(self, goals: List[Goal]) -> bool:
+        """Save goals to storage."""
+        return self.cache.save_json(GOALS_FILE, [asdict(goal) for goal in goals])
+    
+    def create_goal(self, name: str, goal_type: GoalType, target: int, 
+                   difficulty: Optional[Difficulty] = None, deadline_days: int = 30) -> Optional[Goal]:
+        """Create a new goal."""
+        goals = self.get_goals()
+        goal_id = max([g.id for g in goals], default=0) + 1
+        
+        goal = Goal(
+            id=goal_id,
+            name=name,
+            type=goal_type,
+            target=target,
+            difficulty=difficulty,
+            deadline=(date.today() + timedelta(days=deadline_days)).isoformat()
+        )
+        
+        goals.append(goal)
+        if self.save_goals(goals):
+            return goal
+        return None
+    
+    def update_goal_progress(self) -> bool:
+        """Update progress for all active goals."""
+        goals = self.get_goals()
+        if not goals:
+            return True
+        
+        stats = self.stats.calculate_stats(self.stats.problem_service.get_solved_problems())
+        solved_problems = self.stats.problem_service.get_solved_problems()
+        
+        # Get recent solves for weekly targets
+        week_ago = datetime.utcnow() - timedelta(days=7)
+        recent_solves = [
+            p for p in solved_problems 
+            if datetime.fromisoformat(p.completed_at) >= week_ago
+        ]
+        
+        for goal in goals:
+            if goal.status != GoalStatus.ACTIVE:
+                continue
+            
+            # Update progress based on goal type
+            if goal.type == GoalType.TOTAL_SOLVED:
+                goal.current = stats.total_solved
+            elif goal.type == GoalType.DAILY_STREAK:
+                goal.current = stats.current_streak
+            elif goal.type == GoalType.DIFFICULTY_COUNT and goal.difficulty:
+                goal.current = stats.by_difficulty[goal.difficulty]
+            elif goal.type == GoalType.WEEKLY_TARGET:
+                goal.current = len(recent_solves)
+            
+            # Check goal completion
+            if goal.current >= goal.target:
+                goal.status = GoalStatus.COMPLETED
+            elif goal.days_remaining < 0:
+                goal.status = GoalStatus.FAILED
+        
+        return self.save_goals(goals)
+    
+    def create_starter_goals(self) -> bool:
+        """Create default goals for new users."""
+        if self.get_goals():
+            return False  # Already has goals
+        
+        starter_goals = [
+            ("First Steps", GoalType.TOTAL_SOLVED, 5, None, 14),
+            ("Weekly Warrior", GoalType.WEEKLY_TARGET, 3, None, 7),
+            ("Streak Builder", GoalType.DAILY_STREAK, 3, None, 10),
+        ]
+        
+        for name, goal_type, target, difficulty, days in starter_goals:
+            self.create_goal(name, goal_type, target, difficulty, days)
+        
+        return True
+
+# =============================================================================
+# UI COMPONENTS
+# =============================================================================
+
+class DisplayService:
+    """Handles all console output and formatting."""
+    
+    @staticmethod
+    def print_header(text: str) -> None:
+        """Print a formatted header."""
+        print(f"\n🎯 {text}")
+        print("=" * 50)
+    
+    @staticmethod
+    def print_success(text: str) -> None:
+        """Print success message."""
+        print(f"✅ {text}")
+    
+    @staticmethod
+    def print_error(text: str) -> None:
+        """Print error message."""
+        print(f"❌ {text}")
+    
+    @staticmethod
+    def print_warning(text: str) -> None:
+        """Print warning message."""
+        print(f"⚠️ {text}")
+    
+    def display_problems(self, problems: Dict[Difficulty, Optional[Problem]], 
+                        solved_ids: set) -> None:
+        """Display problems in a formatted way."""
+        self.print_header("Your Daily LeetCode Challenge")
+        
+        for difficulty in Difficulty:
+            problem = problems.get(difficulty)
+            icon = DIFFICULTY_ICONS.get(difficulty, "❓")
+            
+            if problem:
+                solved_marker = " ✅" if problem.id in solved_ids else ""
+                print(f"\n{icon} {difficulty.value.upper()}:{solved_marker}")
+                print(f"   ID: {problem.id}")
+                print(f"   Title: {problem.title}")
+                print(f"   Acceptance: {problem.ac_rate:.1f}%")
+                print(f"   Link: {problem.url}")
             else:
-                heatmap_chars.append(HEATMAP_LEVELS[1])
-    
-    return "".join(heatmap_chars)
-
-def calculate_statistics(solved_problems: List[Dict]) -> Dict[str, Any]:
-    """
-    Calculate comprehensive statistics from solved problems.
-    
-    Args:
-        solved_problems: List of solved problem records
+                print(f"\n❌ No {difficulty.value} problem available today.")
         
-    Returns:
-        Dictionary containing various statistics
-    """
-    if not solved_problems:
-        return {
-            "total_solved": 0,
-            "by_difficulty": {"Easy": 0, "Medium": 0, "Hard": 0},
-            "current_streak": 0,
-            "longest_streak": 0,
-            "heatmap": generate_heatmap([])
-        }
+        print()
     
-    total = len(solved_problems)
-    by_difficulty = {"Easy": 0, "Medium": 0, "Hard": 0}
-    
-    for problem in solved_problems:
-        by_difficulty[problem["difficulty"]] += 1
-    
-    current_streak, longest_streak = calculate_streaks(solved_problems)
-    heatmap = generate_heatmap(solved_problems)
-    
-    return {
-        "total_solved": total,
-        "by_difficulty": by_difficulty,
-        "current_streak": current_streak,
-        "longest_streak": longest_streak,
-        "heatmap": heatmap
-    }
-
-def display_weekly_report() -> None:
-    """Display weekly activity report."""
-    solved = load_solved()
-    cutoff = datetime.utcnow() - timedelta(days=7)
-    recent = [p for p in solved if datetime.fromisoformat(p["completed_at"]) >= cutoff]
-    
-    stats = calculate_statistics(recent)
-    
-    print("\n📊 Weekly Report (last 7 days):\n")
-    print(f"Total solved: {stats['total_solved']}")
-    print(f"  🟢 Easy:   {stats['by_difficulty']['Easy']}")
-    print(f"  🟡 Medium: {stats['by_difficulty']['Medium']}")
-    print(f"  🔴 Hard:   {stats['by_difficulty']['Hard']}\n")
-    
-    if recent:
-        print("Recent solves:")
-        for problem in sorted(recent, key=lambda x: x["completed_at"], reverse=True):
-            time_str = datetime.fromisoformat(problem["completed_at"]).strftime("%Y-%m-%d")
-            print(f"  [{problem['id']}] {problem['title']} ({problem['difficulty']}) — {time_str}")
-
-def display_profile() -> None:
-    """Display comprehensive profile with statistics."""
-    # Update goal progress first
-    update_goal_progress()
-    
-    solved = load_solved()
-    stats = calculate_statistics(solved)
-    
-    # Save profile data
-    save_json_file(PROFILE_FILE, stats)
-    
-    # Display statistics
-    print("\n📈 Overall Stats:\n")
-    print(f"Total solved: {stats['total_solved']}")
-    print(f"🟢 Easy:   {stats['by_difficulty']['Easy']}")
-    print(f"🟡 Medium: {stats['by_difficulty']['Medium']}")
-    print(f"🔴 Hard:   {stats['by_difficulty']['Hard']}\n")
-    print(f"🔥 Current streak: {stats['current_streak']} days")
-    print(f"🏆 Longest streak: {stats['longest_streak']} days\n")
-    
-    # Progress bars
-    max_val = max(stats['by_difficulty'].values()) or 1
-    for difficulty, icon in DIFFICULTY_COLORS.items():
-        count = stats['by_difficulty'][difficulty]
-        bar_length = int((count / max_val) * 20)
-        bar = "█" * bar_length
-        print(f"{icon} {difficulty:<6} {bar} {count}")
-
-    # Show goal progress
-    goals = load_goals()
-    active_goals = [g for g in goals if g["status"] == GoalStatus.ACTIVE]
-    if active_goals:
-        print("\n🎯 ACTIVE GOALS:")
-        for goal in active_goals[:3]:  # Show first 3 active goals
-            progress = (goal["current"] / goal["target"]) * 100
-            print(f"   {goal['name']}: {goal['current']}/{goal['target']} ({progress:.1f}%)")
-    
-    # Heatmap display (grouped by weeks)
-    heatmap_chars = list(stats['heatmap'])
-    heatmap_display = []
-    for i in range(0, len(heatmap_chars), 7):
-        heatmap_display.append(" ".join(heatmap_chars[i:i+7]))
-    
-    print("\n📅 Last 30 days heatmap:\n")
-    for week in heatmap_display:
-        print(week)
-    print("\n🟩 = 1 solved, 🟡 = 2, 🟠 = 3, 🔴 = 4+, ⬛ = none\n")
-
-# =============================================================================
-# PROBLEM STATUS MANAGEMENT
-# =============================================================================
-
-def mark_problem_status(problem_id: str, mark_as_solved: bool, force_refresh: bool = False) -> None:
-    """
-    Mark a problem as solved or incomplete.
-    
-    Args:
-        problem_id: ID of the problem to update
-        mark_as_solved: True to mark as solved, False to mark as incomplete
-        force_refresh: Whether to refresh problem cache
-    """
-    solved = load_solved()
-    problem_id_str = str(problem_id)
-    
-    # Check if problem is already in desired state
-    is_currently_solved = any(str(p["id"]) == problem_id_str for p in solved)
-    
-    if mark_as_solved and is_currently_solved:
-        print(f"⚠️ Problem {problem_id} is already marked as solved.")
-        return
-    elif not mark_as_solved and not is_currently_solved:
-        print(f"⚠️ Problem {problem_id} was not marked as solved.")
-        return
-    
-    if mark_as_solved:
-        # Find problem details
-        all_problems = fetch_all_problems(force_refresh) if force_refresh else fetch_all_problems()
-        daily_cache = load_daily_cache(date.today())
-        
-        problem = find_problem_by_id(problem_id, [all_problems, daily_cache])
-        
-        if not problem:
-            print(f"❌ Problem {problem_id} not found.")
+    def display_solved_problems(self, solved_problems: List[SolvedProblem]) -> None:
+        """Display all solved problems."""
+        if not solved_problems:
+            self.print_warning("No problems solved yet.")
             return
         
-        # Add to solved list
-        solved.append({
-            "id": problem["frontendQuestionId"],
-            "title": problem["title"],
-            "slug": problem["titleSlug"],
-            "difficulty": problem["difficulty"],
-            "completed_at": datetime.utcnow().isoformat()
-        })
-        save_solved(solved)
-        print(f"✅ Problem {problem_id} ({problem['title']}) marked as solved.")
+        self.print_header("Solved Problems")
         
-    else:
-        # Remove from solved list
-        solved = [p for p in solved if str(p["id"]) != problem_id_str]
-        save_solved(solved)
-        print(f"↩️ Problem {problem_id} marked as incomplete.")
-    
-    # Update profile after status change
-    if mark_as_solved or (not mark_as_solved and is_currently_solved):
-        stats = calculate_statistics(load_solved())
-        save_json_file(PROFILE_FILE, stats)
-
-# =============================================================================
-# GOAL MANAGEMENT
-# =============================================================================
-
-def load_goals() -> List[Dict]:
-    """Load goals from file."""
-    return load_json_file(GOALS_FILE, [])
-
-def save_goals(goals: List[Dict]) -> None:
-    """Save goals to file."""
-    save_json_file(GOALS_FILE, goals)
-
-def create_goal(name: str, goal_type: str, target: int, difficulty: str | None = None, deadline_days: int = 30) -> None:
-    """Create a new goal."""
-    goals = load_goals()
-    
-    goal = {
-        "id": len(goals) + 1,
-        "name": name,
-        "type": goal_type,
-        "target": target,
-        "current": 0,
-        "difficulty": difficulty,
-        "created_date": date.today().isoformat(),
-        "deadline": (date.today() + timedelta(days=deadline_days)).isoformat(),
-        "status": GoalStatus.ACTIVE
-    }
-    
-    goals.append(goal)
-    save_goals(goals)
-    print(f"✅ Goal '{name}' created! (ID: {goal['id']})")
-
-def update_goal_progress() -> None:
-    """Update progress for all active goals based on current stats."""
-    goals = load_goals()
-    if not goals:
-        return
-        
-    stats = calculate_statistics(load_solved())
-    solved = load_solved()
-    
-    # Get recent solves (last 7 days for weekly targets)
-    week_ago = datetime.utcnow() - timedelta(days=7)
-    recent_solves = [p for p in solved if datetime.fromisoformat(p["completed_at"]) >= week_ago]
-    
-    for goal in goals:
-        if goal["status"] != GoalStatus.ACTIVE:
-            continue
-            
-        if goal["type"] == GoalType.TOTAL_SOLVED:
-            goal["current"] = stats["total_solved"]
-        elif goal["type"] == GoalType.DAILY_STREAK:
-            goal["current"] = stats["current_streak"]
-        elif goal["type"] == GoalType.DIFFICULTY_COUNT and goal["difficulty"]:
-            goal["current"] = stats["by_difficulty"][goal["difficulty"]]
-        elif goal["type"] == GoalType.WEEKLY_TARGET:
-            goal["current"] = len(recent_solves)
-        
-        # Check if goal is completed
-        if goal["current"] >= goal["target"]:
-            goal["status"] = GoalStatus.COMPLETED
-            goal["completed_date"] = date.today().isoformat()
-        # Check if goal is failed (past deadline)
-        elif date.fromisoformat(goal["deadline"]) < date.today():
-            goal["status"] = GoalStatus.FAILED
-    
-    save_goals(goals)
-
-def display_goals() -> None:
-    """Display all goals with progress."""
-    update_goal_progress()  # Refresh progress first
-    goals = load_goals()
-    
-    if not goals:
-        print("🎯 No goals set yet. Use 'leetcode create-goal' to get started!")
-        return
-    
-    active_goals = [g for g in goals if g["status"] == GoalStatus.ACTIVE]
-    completed_goals = [g for g in goals if g["status"] == GoalStatus.COMPLETED]
-    
-    print("\n🎯 YOUR GOALS\n")
-    
-    if active_goals:
-        print("📈 ACTIVE GOALS:")
-        for goal in active_goals:
-            progress = (goal["current"] / goal["target"]) * 100
-            bar = "█" * int(progress / 5) + "░" * (20 - int(progress / 5))
-            deadline = date.fromisoformat(goal["deadline"])
-            days_left = (deadline - date.today()).days
-            
-            print(f"   {goal['id']}. {goal['name']}")
-            print(f"      {bar} {goal['current']}/{goal['target']} ({progress:.1f}%)")
-            print(f"      📅 Deadline: {deadline} ({days_left} days left)")
-            if goal["difficulty"]:
-                print(f"      🎯 Difficulty: {goal['difficulty']}")
+        for problem in sorted(solved_problems, key=lambda p: int(p.problem_id)):
+            icon = DIFFICULTY_ICONS.get(problem.difficulty, "❓")
+            date_str = datetime.fromisoformat(problem.completed_at).strftime("%Y-%m-%d")
+            print(f"{icon} [{problem.problem_id}] {problem.title}")
+            print(f"   Completed: {date_str}")
+            print(f"   Link: https://leetcode.com/problems/{problem.slug}/")
             print()
     
-    if completed_goals:
-        print("✅ COMPLETED GOALS:")
-        for goal in completed_goals:
-            completed_date = goal.get("completed_date", goal["deadline"])
-            print(f"   {goal['id']}. {goal['name']} - Completed on {completed_date}")
-        print()
-
-def quick_start_goals() -> None:
-    """Create some default goals for new users."""
-    goals = load_goals()
-    if goals:
-        return
+    def display_stats(self, stats: UserStats) -> None:
+        """Display user statistics."""
+        self.print_header("Your LeetCode Stats")
         
-    default_goals = [
-        {"name": "First Steps", "goal_type": GoalType.TOTAL_SOLVED, "target": 5, "difficulty": None, "deadline_days": 14},
-        {"name": "Weekly Warrior", "goal_type": GoalType.WEEKLY_TARGET, "target": 3, "difficulty": None, "deadline_days": 7},
-        {"name": "Streak Builder", "goal_type": GoalType.DAILY_STREAK, "target": 3, "difficulty": None, "deadline_days": 10},
-    ]
+        print(f"Total Solved: {stats.total_solved}")
+        print(f"🟢 Easy:   {stats.by_difficulty[Difficulty.EASY]}")
+        print(f"🟡 Medium: {stats.by_difficulty[Difficulty.MEDIUM]}")
+        print(f"🔴 Hard:   {stats.by_difficulty[Difficulty.HARD]}")
+        print(f"\n🔥 Current Streak: {stats.current_streak} days")
+        print(f"🏆 Longest Streak: {stats.longest_streak} days")
+        
+        # Progress bars
+        max_count = max(stats.by_difficulty.values()) or 1
+        print("\nProgress:")
+        for difficulty in Difficulty:
+            count = stats.by_difficulty[difficulty]
+            bar_length = int((count / max_count) * 20)
+            bar = "█" * bar_length + "░" * (20 - bar_length)
+            icon = DIFFICULTY_ICONS[difficulty]
+            print(f"{icon} {difficulty.value:<6} {bar} {count}")
     
-    for goal_data in default_goals:
-        create_goal(**goal_data)
+    def display_goals(self, goals: List[Goal]) -> None:
+        """Display goals with progress."""
+        active_goals = [g for g in goals if g.status == GoalStatus.ACTIVE]
+        completed_goals = [g for g in goals if g.status == GoalStatus.COMPLETED]
+        failed_goals = [g for g in goals if g.status == GoalStatus.FAILED]
+        
+        if active_goals:
+            self.print_header("Active Goals")
+            for goal in active_goals:
+                bar_length = int((goal.progress_percentage / 100) * 20)
+                bar = "█" * bar_length + "░" * (20 - bar_length)
+                
+                print(f"\n{goal.id}. {goal.name}")
+                print(f"   {bar} {goal.current}/{goal.target} ({goal.progress_percentage:.1f}%)")
+                print(f"   📅 {goal.days_remaining} days remaining")
+                if goal.difficulty:
+                    print(f"   🎯 Difficulty: {goal.difficulty.value}")
+        
+        if completed_goals:
+            self.print_header("Completed Goals")
+            for goal in completed_goals:
+                print(f"✅ {goal.name} - Completed!")
+        
+        if failed_goals:
+            self.print_header("Failed Goals")
+            for goal in failed_goals:
+                print(f"❌ {goal.name} - Failed")
+        
+        if not any([active_goals, completed_goals, failed_goals]):
+            self.print_warning("No goals set yet. Use 'create-goal' to get started!")
     
-    print("🎯 Created starter goals! Use 'leetcode goals' to view them.")
+    def display_heatmap(self, heatmap: str) -> None:
+        """Display activity heatmap."""
+        if not heatmap:
+            return
+        
+        print("\n📅 Last 30 Days Activity:")
+        # Group into weeks
+        weeks = [heatmap[i:i+7] for i in range(0, len(heatmap), 7)]
+        for week in weeks:
+            print(" ".join(week))
+        
+        print("\nLegend: ⚫=0 🟢=1 🟡=2 🟠=3 🔴=4+")
+
+# =============================================================================
+# APPLICATION CORE
+# =============================================================================
+
+class LeetCodeTracker:
+    """Main application controller."""
+    
+    def __init__(self):
+        CacheService.ensure_directories()
+        
+        self.cache = CacheService()
+        self.problem_service = ProblemService(self.cache)
+        self.stats_service = StatsService(self.problem_service)
+        self.goal_service = GoalService(self.cache, self.stats_service)
+        self.display = DisplayService()
+    
+    async def fetch_daily_problems(self, target_date: date, force_refresh: bool = False) -> None:
+        """Fetch and display daily problems."""
+        problems = await self.problem_service.generate_daily_problems(target_date)
+        solved_ids = {sp.problem_id for sp in self.problem_service.get_solved_problems()}
+        self.display.display_problems(problems, solved_ids)
+    
+    async def mark_problem_solved(self, problem_id: str, force_refresh: bool = False) -> None:
+        """Mark a problem as solved."""
+        all_problems = await self.problem_service.get_all_problems(force_refresh)
+        
+        if problem_id not in all_problems:
+            self.display.print_error(f"Problem {problem_id} not found.")
+            return
+        
+        problem = all_problems[problem_id]
+        if self.problem_service.mark_problem_solved(problem_id, problem):
+            self.display.print_success(f"Marked '{problem.title}' as solved!")
+            self.goal_service.update_goal_progress()
+        else:
+            self.display.print_warning(f"Problem {problem_id} was already solved.")
+    
+    def mark_problem_unsolved(self, problem_id: str) -> None:
+        """Mark a problem as unsolved."""
+        if self.problem_service.mark_problem_unsolved(problem_id):
+            self.display.print_success(f"Marked problem {problem_id} as unsolved.")
+            self.goal_service.update_goal_progress()
+        else:
+            self.display.print_warning(f"Problem {problem_id} was not marked as solved.")
+    
+    def show_solved_problems(self) -> None:
+        """Display solved problems."""
+        solved = self.problem_service.get_solved_problems()
+        self.display.display_solved_problems(solved)
+    
+    def show_profile(self) -> None:
+        """Display user profile with statistics."""
+        solved = self.problem_service.get_solved_problems()
+        stats = self.stats_service.calculate_stats(solved)
+        
+        self.display.display_stats(stats)
+        self.display.display_heatmap(stats.heatmap)
+        
+        # Update and show goals
+        self.goal_service.update_goal_progress()
+        goals = self.goal_service.get_goals()
+        self.display.display_goals(goals)
+    
+    def show_goals(self) -> None:
+        """Display goals."""
+        self.goal_service.update_goal_progress()
+        goals = self.goal_service.get_goals()
+        self.display.display_goals(goals)
+    
+    def create_goal(self, name: str, goal_type: str, target: int, difficulty: str = None) -> None:
+        """Create a new goal."""
+        try:
+            goal_type_enum = GoalType(goal_type)
+            difficulty_enum = Difficulty(difficulty) if difficulty else None
+            
+            goal = self.goal_service.create_goal(name, goal_type_enum, target, difficulty_enum)
+            if goal:
+                self.display.print_success(f"Created goal: {name}")
+            else:
+                self.display.print_error("Failed to create goal.")
+        except ValueError as e:
+            self.display.print_error(f"Invalid goal parameters: {e}")
+    
+    def setup_starter_goals(self) -> None:
+        """Create starter goals for new users."""
+        if self.goal_service.create_starter_goals():
+            self.display.print_success("Created starter goals!")
+        else:
+            self.display.print_warning("You already have goals set up.")
 
 # =============================================================================
 # COMMAND LINE INTERFACE
 # =============================================================================
 
+def parse_date_arg(args: List[str]) -> date:
+    """Parse date from command line arguments."""
+    if "--today" in args:
+        return date.today()
+    if "--yesterday" in args:
+        return date.today() - timedelta(days=1)
+    
+    # Support -d YYYY-MM-DD or --date=YYYY-MM-DD
+    date_str = None
+    if "-d" in args:
+        idx = args.index("-d")
+        if idx + 1 < len(args):
+            date_str = args[idx + 1]
+    
+    if not date_str:
+        for arg in args:
+            if arg.startswith("--date="):
+                date_str = arg.split("=", 1)[1]
+                break
+    
+    if date_str:
+        try:
+            return datetime.strptime(date_str, "%Y-%m-%d").date()
+        except ValueError:
+            print(f"❌ Invalid date format: {date_str}. Using today's date.")
+    
+    return date.today()
+
 def print_help() -> None:
     """Display help message."""
     print("""
-leetcode - Your Daily LeetCode CLI 🎯
+LeetCode Tracker CLI 🚀
 
-Usage:
-  leetcode fetch [options]           Fetch daily random problems
-  leetcode markAsDone [id]           Mark problem as solved
-  leetcode markAsIncomplete [id]     Unmark problem as solved
-  leetcode listSolved                Show all solved problems
-  leetcode report                    Show weekly activity report
-  leetcode get profile               Show overall stats, streaks and goals
-  leetcode stats                     Alias for 'get profile'
-  leetcode goals                     View your goals and progress
-  leetcode create-goal [args]        Create a new goal
-  leetcode quick-goals               Create starter goals for beginners
+A production-ready tool for tracking your LeetCode progress with goals, 
+statistics, and daily problem recommendations.
 
-Options for 'fetch':
-  -d YYYY-MM-DD      Fetch for a specific date
-  --date=YYYY-MM-DD  Same as -d
-  --today            Fetch today's problems (default)
-  --yesterday        Fetch yesterday's problems
-  --refresh-cache    Force refresh problem cache
+USAGE:
+  leetcode fetch [OPTIONS]        Fetch daily random problems
+  leetcode mark-done ID           Mark problem as solved
+  leetcode mark-undo ID           Unmark problem as solved  
+  leetcode solved                 Show solved problems
+  leetcode profile                Show stats, streaks and goals
+  leetcode goals                  View goals and progress
+  leetcode create-goal            Create a new goal
+  leetcode quick-start            Create starter goals
 
-Other:
-  -h, --help         Show this help message
+OPTIONS for fetch:
+  -d YYYY-MM-DD, --date=YYYY-MM-DD   Specific date (default: today)
+  --today, --yesterday                Date shortcuts
+  --refresh-cache                     Force refresh problem cache
+
+EXAMPLES:
+  leetcode fetch                     # Get today's problems
+  leetcode fetch -d 2024-01-15       # Get problems for specific date
+  leetcode mark-done 42              # Mark problem 42 as solved
+  leetcode profile                   # View comprehensive stats
+  leetcode create-goal              # Interactive goal creation
+
+QUICK START:
+  leetcode quick-start              # Set up starter goals
+  leetcode fetch                    # Get daily problems
+  leetcode profile                  # Track your progress
 """)
 
-def main() -> None:
-    """Main command line interface handler."""
-    ensure_directories()
-    
+async def main() -> None:
+    """Main application entry point."""
     if len(sys.argv) < 2:
         print_help()
-        sys.exit(1)
-
+        return
+    
     command = sys.argv[1]
-
-    # Quick start goals for new users
-    if not os.path.exists(GOALS_FILE):
-        quick_start_goals()
-
-    if command in ("-h", "--help"):
-        print_help()
+    tracker = LeetCodeTracker()
     
-    elif command == "goals":
-        display_goals()
-    
-    elif command == "create-goal" and len(sys.argv) >= 5:
-        # leetcode create-goal "Goal Name" total_solved 10
-        name = sys.argv[2]
-        goal_type = sys.argv[3]
-        target = int(sys.argv[4])
-        difficulty = sys.argv[5] if len(sys.argv) > 5 else None
-        create_goal(name, goal_type, target, str(difficulty))
-    
-    elif command == "quick-goals":
-        quick_start_goals()
-
-    elif command == "fetch":
-        seed_date = parse_date_arg(sys.argv[2:])
-        force_refresh = "--refresh-cache" in sys.argv[2:]
+    try:
+        if command in ("-h", "--help", "help"):
+            print_help()
         
-        if force_refresh:
-            print("🔄 Refreshing problems cache...")
-            fetch_all_problems(force_refresh=True)
+        elif command == "fetch":
+            seed_date = parse_date_arg(sys.argv[2:])
+            force_refresh = "--refresh-cache" in sys.argv[2:]
+            await tracker.fetch_daily_problems(seed_date, force_refresh)
         
-        print(f"Fetching LeetCode problems for {seed_date.isoformat()}...")
-        problems = get_random_unsolved_problems(seed_date)
-        display_problems(problems)
-    
-    elif command == "markAsDone" and len(sys.argv) >= 3:
-        force_refresh = "--refresh-cache" in sys.argv
-        mark_problem_status(sys.argv[2], mark_as_solved=True, force_refresh=force_refresh)
-    
-    elif command == "markAsIncomplete" and len(sys.argv) == 3:
-        mark_problem_status(sys.argv[2], mark_as_solved=False)
-    
-    elif command == "listSolved":
-        display_solved_problems()
-    
-    elif command == "report":
-        display_weekly_report()
-    
-    elif command in ("stats", "get"):
-        if command == "get" and len(sys.argv) > 2 and sys.argv[2] == "profile":
-            display_profile()
-        elif command == "stats" or (command == "get" and len(sys.argv) == 2):
-            display_profile()
+        elif command == "mark-done" and len(sys.argv) >= 3:
+            force_refresh = "--refresh-cache" in sys.argv
+            await tracker.mark_problem_solved(sys.argv[2], force_refresh)
+        
+        elif command == "mark-undo" and len(sys.argv) == 3:
+            tracker.mark_problem_unsolved(sys.argv[2])
+        
+        elif command == "solved":
+            tracker.show_solved_problems()
+        
+        elif command in ("profile", "stats"):
+            tracker.show_profile()
+        
+        elif command == "goals":
+            tracker.show_goals()
+        
+        elif command == "create-goal":
+            # Interactive goal creation
+            name = input("Goal name: ").strip()
+            print("Goal types: total_solved, daily_streak, difficulty_count, weekly_target")
+            goal_type = input("Goal type: ").strip()
+            target = int(input("Target: ").strip())
+            
+            difficulty = None
+            if goal_type == "difficulty_count":
+                print("Difficulties: Easy, Medium, Hard")
+                difficulty = input("Difficulty: ").strip()
+            
+            tracker.create_goal(name, goal_type, target, difficulty)
+        
+        elif command == "quick-start":
+            tracker.setup_starter_goals()
+            print("\nNow run 'leetcode fetch' to get your daily problems!")
+        
         else:
-            print("⚠️ Usage: leetcode get profile")
+            print(f"❌ Unknown command: {command}")
+            print_help()
     
-    else:
-        print("❌ Invalid command or arguments.")
-        print_help()
-        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\n👋 Goodbye!")
+    except Exception as e:
+        print(f"❌ Unexpected error: {e}")
+        if os.getenv("DEBUG"):
+            raise
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
